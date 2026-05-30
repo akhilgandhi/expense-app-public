@@ -76,7 +76,8 @@ Legend:
 | **Event-Driven** | All state changes propagate as typed domain events over RabbitMQ/Kafka |
 | **Choreography over Orchestration** | Services react to events; no central saga orchestrator |
 | **Single Entrypoint** | Dashboard Service is the only externally exposed composite API |
-| **Schema-First REST** | OpenAPI specs in `api-contracts` → generated Java interfaces |
+| **Schema-First REST** | OpenAPI specs in `api-contracts/openapi/` → generated Java interfaces |
+| **Schema-First Events** | AsyncAPI 3.0 specs in `api-contracts/events/` → generated Java payload classes via AsyncAPI CLI |
 | **Resilient** | Circuit breaker + retry + time limiter on all upstream calls (Resilience4j) |
 | **Observable** | Prometheus metrics, distributed tracing (Jaeger), structured logs (EFK) |
 | **Secure** | OAuth2/JWT, mTLS between all services, Istio request authentication |
@@ -89,11 +90,11 @@ Legend:
 |---------|------|------|----------|----------------|
 | [authorization-server](#authorization-server) | Auth | 9999 | In-memory | None |
 | [dashboard-service](#42-dashboard-service-composite) | Composite | 8089 | None | Producer (5 topics) |
-| [account-service](#43-account-service) | Core | 8081 | MongoDB | Consumer + event reactor |
-| [budget-service](#44-budget-service) | Core | 8082 | MongoDB | Consumer + event reactor |
+| [account-service](#43-account-service) | Core | 8081 | MongoDB | Consumer + event producer |
+| [budget-service](#44-budget-service) | Core | 8082 | MongoDB | Consumer + event producer |
 | [expense-service](#45-expense-service) | Core | 8083 | MySQL | Consumer + event producer |
-| [goal-service](#46-goal-service) | Core | 8084 | MySQL | Consumer + event reactor |
-| [invest-service](#47-investment-service-graphql) | Core | 8082* | MongoDB | Consumer |
+| [goal-service](#46-goal-service) | Core | 8084 | MySQL | Consumer + event producer |
+| [invest-service](#47-investment-service-graphql) | Core | 8082* | MongoDB | Consumer + event producer |
 | gateway-server | Edge | 8443 | None | None (build only, no Helm chart yet) |
 
 > \* invest-service port conflicts with budget-service in local config. Use Docker/K8s for concurrent local testing.
@@ -104,7 +105,7 @@ Legend:
 
 ## 3. Quick Start
 
-> **Prerequisites:** Minikube, kubectl, Helm ≥ 3.14, istioctl ≥ 1.23, Docker Desktop, Java 25, Jenkins (local brew), Nexus (local brew)
+> **Prerequisites:** Minikube, kubectl, Helm ≥ 3.14, istioctl ≥ 1.23, Docker Desktop, Java 25, Node.js 18+, Jenkins (local brew), Nexus (local brew)
 
 ### 3.1 One-time cluster bootstrap
 
@@ -146,7 +147,7 @@ This deploys: cert-manager · Istio · EFK logging · MySQL · MongoDB · Rabbit
 ### 3.3 Build and deploy services (in order)
 
 ```
-1. Jenkins → api-contracts → main → Build Now          (shared library — build first)
+1. Jenkins → api-contracts → main → Build Now          (shared library — build first; requires Node.js 18+)
 
 2. Jenkins → authorization-server → main → Build Now
 3. Jenkins → account-service → main → Build Now
@@ -444,7 +445,7 @@ curl -s -X POST https://minikube.me/dashboard/1/expense \
   }'
 ```
 
-> When `budgetId` is provided, the expense triggers budget deduction via the `expense-events` topic. If account balance is insufficient, the expense is rejected and an `EXPENSE_REJECTED` event is published.
+> When `budgetId` is provided, the expense triggers budget deduction via the `expenses` topic. If account balance is insufficient, the expense is rejected and an `EXPENSE_REJECTED` event is published on the `expenses` topic — triggering cancellation in expense-service and budget reversal in budget-service.
 
 **ExpenseStatus values:** `PENDING` · `COMPLETED` · `CANCELLED`
 
@@ -551,10 +552,10 @@ kubectl port-forward -n expense-app-dev svc/budget-service 8082:80
 
 | Event | Trigger | Consumer |
 |-------|---------|----------|
-| `BUDGET_UPDATED` | Expense deducted from budget | Goal Service |
-| `BUDGET_EXCEEDED` | remainingAmount < 0 | Goal Service |
-| `BUDGET_THRESHOLD_WARNING` | remainingAmount < 20% of total | Goal Service |
-| `BUDGET_REVERSAL` | Expense cancelled, budget restored | Goal Service |
+| `BUDGET_UPDATED` | Expense deducted from budget | goal-service |
+| `BUDGET_EXCEEDED` | remainingAmount < 0 | goal-service |
+| `BUDGET_THRESHOLD_WARNING` | remainingAmount < 20% of total | (no consumer yet) |
+| `BUDGET_REVERSAL` | Expense rejected — budget deduction reversed | (future consumers) |
 
 ---
 
@@ -711,17 +712,76 @@ All stream bindings use **Spring Cloud Stream** — swapping brokers requires no
 
 ### 5.2 Topic Map
 
+**One topic per domain aggregate.** All events for a domain travel on one topic regardless of direction. The `Event.Type` field routes within the topic — consumers switch on event type and ignore cases they don't own.
+
 | Topic | Producers | Consumers | Event Types |
 |-------|-----------|-----------|-------------|
-| `accounts` | Dashboard | Account | `CREATE` · `DELETE` |
-| `budgets` | Dashboard | Budget | `CREATE` · `DELETE` |
-| `expenses` | Dashboard, Expense | Expense, Budget, Goal | `CREATE` · `DELETE` |
-| `goals` | Dashboard | Goal | `CREATE` · `DELETE` |
-| `investments` | Dashboard | Invest | `CREATE` · `DELETE` |
-| `expense-events` | Expense, Account | Account, Budget | `EXPENSE_CREATED` · `EXPENSE_REJECTED` |
-| `budget-events` | Budget | Goal | `BUDGET_UPDATED` · `BUDGET_EXCEEDED` · `BUDGET_THRESHOLD_WARNING` · `BUDGET_REVERSAL` |
+| `accounts` | dashboard-service, account-service | account-service | `CREATE_ACCOUNT` · `DELETE_ACCOUNT` · `BALANCE_UPDATED` |
+| `budgets` | dashboard-service, budget-service | budget-service, goal-service | `CREATE_BUDGET` · `DELETE_BUDGETS` · `BUDGET_UPDATED` · `BUDGET_EXCEEDED` · `BUDGET_THRESHOLD_WARNING` · `BUDGET_REVERSAL` |
+| `expenses` | dashboard-service, expense-service, account-service | expense-service, budget-service, account-service | `CREATE_EXPENSE` · `DELETE_EXPENSES` · `EXPENSE_CREATED` · `EXPENSE_REJECTED` |
+| `goals` | dashboard-service, goal-service | goal-service | `CREATE_GOAL` · `DELETE_GOALS` · `GOAL_AT_RISK` · `GOAL_COMPLETED` |
+| `investments` | dashboard-service, invest-service | invest-service | `CREATE_INVESTMENT` · `DELETE_INVESTMENTS` · `INVESTMENT_CREATED` |
 
-### 5.3 Event Flow Diagrams
+### 5.3 Event Type Registry
+
+All event types are defined in `Event.Type` in `api-contracts`. Types are domain-scoped — every event is self-describing regardless of which topic it arrived on.
+
+```
+# CRUD commands — dashboard-service → core services
+CREATE_ACCOUNT       DELETE_ACCOUNT
+CREATE_EXPENSE       DELETE_EXPENSES
+CREATE_BUDGET        DELETE_BUDGETS
+CREATE_GOAL          DELETE_GOALS
+CREATE_INVESTMENT    DELETE_INVESTMENTS
+
+# Expense lifecycle
+EXPENSE_CREATED      # expense-service → budget-service, account-service
+EXPENSE_REJECTED     # account-service → expense-service, budget-service
+
+# Budget state changes
+BUDGET_UPDATED
+BUDGET_EXCEEDED
+BUDGET_THRESHOLD_WARNING
+BUDGET_REVERSAL      # budget-service → (future consumers)
+
+# Account state changes
+BALANCE_UPDATED      # account-service → (dashboard, analytics)
+
+# Goal state changes
+GOAL_AT_RISK
+GOAL_COMPLETED
+
+# Investment lifecycle
+INVESTMENT_CREATED   # invest-service → (goal-service, analytics)
+```
+
+### 5.4 Event Envelope
+
+Every event is wrapped in `Event<K, T>` from `api-contracts`. The envelope carries idempotency and observability metadata alongside the domain payload.
+
+```java
+public class Event<K, T> {
+    String   eventId;        // UUID v4 — idempotency key
+    Type     eventType;      // domain-scoped enum value
+    K        key;            // partition key (accountId)
+    T        data;           // typed domain payload
+    Instant  occurredAt;     // wall-clock time of originating action
+    String   source;         // originating service name
+    int      schemaVersion;  // payload schema version (starts at 1)
+}
+```
+
+**Payload schemas** are defined as AsyncAPI 3.0 specs in `api-contracts/events/` and generated into Java classes via the AsyncAPI CLI at build time:
+
+| Schema file | Generated classes |
+|-------------|------------------|
+| `expense-events.asyncapi.yaml` | `ExpenseCreated`, `ExpenseRejected` |
+| `budget-events.asyncapi.yaml` | `BudgetUpdated`, `BudgetReversal` |
+| `account-events.asyncapi.yaml` | `AccountUpdate` (BalanceUpdated payload) |
+| `goal-events.asyncapi.yaml` | `GoalAtRisk`, `GoalCompleted` |
+| `investment-events.asyncapi.yaml` | `InvestmentCreated` |
+
+### 5.5 Event Flow Diagrams
 
 #### Create Expense Flow
 
@@ -731,25 +791,28 @@ Client
   ▼ POST /dashboard/{id}/expense
 Dashboard Service
   │
-  ├──[expenses topic: CREATE]──────────────────────────────────────────────────►
+  ├──[expenses topic: CREATE_EXPENSE]──────────────────────────────────────────►
   │                                                                             │
   │                                                                      Expense Service
   │                                                                             │
   │                                                              balance check against
   │                                                              account balance
   │                                                                             │
-  │◄──[expense-events: EXPENSE_CREATED or EXPENSE_REJECTED]────────────────────┘
+  │◄──[expenses topic: EXPENSE_CREATED or EXPENSE_REJECTED]────────────────────┘
   │                                                                             │
   │                           Account Service ◄────────────────────────────────┘
-  │                           (deducts balance if CREATED,
-  │                            no-op if REJECTED)
+  │                           EXPENSE_CREATED → deducts balance, publishes BALANCE_UPDATED
+  │                           EXPENSE_REJECTED → publishes on expenses topic
   │
-  │                           Budget Service ◄─────[expense-events: EXPENSE_CREATED]
-  │                           (deducts remainingAmount,
-  │                            publishes BUDGET_UPDATED/EXCEEDED/WARNING)
+  │                           Budget Service ◄──────[expenses: EXPENSE_CREATED]
+  │                           deducts remainingAmount
+  │                           publishes BUDGET_UPDATED/EXCEEDED/WARNING on budgets topic
+  │                           ◄────────────────[expenses: EXPENSE_REJECTED]
+  │                           reverses deduction, publishes BUDGET_REVERSAL on budgets topic
   │
-  │                           Goal Service ◄───────[budget-events: BUDGET_*]
-  │                           (updates goal status to AT_RISK if budget exceeded)
+  │                           Goal Service ◄────────[budgets: BUDGET_EXCEEDED]
+  │                           updates goal status to AT_RISK
+  │                           publishes GOAL_AT_RISK on goals topic
 ```
 
 #### Account Deletion Cascade
@@ -760,14 +823,14 @@ Client
   ▼ DELETE /dashboard/{accountId}
 Dashboard Service
   │
-  ├──[accounts: DELETE]──────────► Account Service    (deletes account record)
-  ├──[budgets: DELETE]───────────► Budget Service     (deletes all budgets)
-  ├──[expenses: DELETE]──────────► Expense Service    (deletes all expenses)
-  ├──[goals: DELETE]─────────────► Goal Service       (deletes all goals)
-  └──[investments: DELETE]───────► Invest Service     (deletes all investments)
+  ├──[accounts: DELETE_ACCOUNT]──────► Account Service    (deletes account record)
+  ├──[budgets: DELETE_BUDGETS]───────► Budget Service     (deletes all budgets)
+  ├──[expenses: DELETE_EXPENSES]─────► Expense Service    (deletes all expenses)
+  ├──[goals: DELETE_GOALS]───────────► Goal Service       (deletes all goals)
+  └──[investments: DELETE_INVESTMENTS]► Invest Service    (deletes all investments)
 ```
 
-### 5.4 Resilience Patterns
+### 5.6 Resilience Patterns
 
 All Dashboard Service calls to upstream services use:
 
@@ -786,13 +849,49 @@ Consumer retry policy (all services):
 | Max backoff | 1000ms |
 | Multiplier | 2.0 |
 
-### 5.5 Dead Letter Queue
+### 5.7 Dead Letter Topics
 
-Failed messages are:
-1. Retried 3 times with exponential backoff
-2. Routed to a DLQ topic: `{topic}.{consumerGroup}.DLQ`
-3. Persisted in Account Service MongoDB collection `dlq_analytics` (TTL: 30 days)
-4. Optionally forwarded to AWS SNS topic `dlq-processor` for alerting
+Every consumer binding has a Dead Letter Topic (DLT) configured so a malformed or unprocessable event does not halt partition consumption.
+
+**Naming convention:** `{spring.application.name}.{functionBeanName}.dlt`
+
+| Service | Consumer bean | DLT name |
+|---------|--------------|----------|
+| expense-service | `messageProcessor` | `expense-service.messageProcessor.dlt` |
+| budget-service | `messageProcessor` | `budget-service.messageProcessor.dlt` |
+| budget-service | `expenseEventProcessor` | `budget-service.expenseEventProcessor.dlt` |
+| budget-service | `expenseRejectionProcessor` | `budget-service.expenseRejectionProcessor.dlt` |
+| account-service | `messageProcessor` | `account-service.messageProcessor.dlt` |
+| account-service | `expenseEventProcessor` | `account-service.expenseEventProcessor.dlt` |
+| goal-service | `messageProcessor` | `goal-service.messageProcessor.dlt` |
+| goal-service | `budgetEventProcessor` | `goal-service.budgetEventProcessor.dlt` |
+| invest-service | `messageProcessor` | `invest-service.messageProcessor.dlt` |
+
+Failed messages retry 3× then land in the DLT without blocking the consumer.
+
+### 5.8 Idempotency
+
+Each consumer service deduplicates events by `eventId` (UUID in the `Event<K,T>` envelope) to prevent double-processing under Kafka at-least-once delivery.
+
+| Service | DB | Idempotency store |
+|---------|----|------------------|
+| expense-service | MySQL | `processed_events` table (Flyway migration) |
+| goal-service | MySQL | `processed_events` table (Flyway migration) |
+| account-service | MongoDB | `processed_events` collection (`@Document`) |
+| budget-service | MongoDB | `processed_events` collection (`@Document`) |
+| invest-service | MongoDB | `processed_events` collection (`@Document`) |
+
+Before processing any event: check `eventId` not already in store. Insert after successful commit. dashboard-service is publish-only — no idempotency needed.
+
+### 5.9 Partitioning Strategy
+
+Partition key = **account ID** for all domain events. Guarantees total ordering of events within an account across all topics. Set via `MessageBuilder.setHeader("partitionKey", accountId)`.
+
+Dashboard Service supports Kafka partitioned streams via the `streaming_partitioned` Spring profile:
+
+```yaml
+SPRING_PROFILES_ACTIVE: docker,kafka,streaming_partitioned
+```
 
 ---
 
@@ -800,11 +899,11 @@ Failed messages are:
 
 | Service | Engine | Database | Collections / Tables | Notes |
 |---------|--------|----------|----------------------|-------|
-| account-service | MongoDB | `account-db` | `accounts`, `dlq_analytics` | DLQ TTL: 30 days |
-| budget-service | MongoDB | `budget-db` | `budgets` | |
-| invest-service | MongoDB | `invest-db` | `investments` | |
-| expense-service | MySQL | `expensedb` | `expenses` | JPA/Hibernate |
-| goal-service | MySQL | `goaldb` | `goals` | JPA/Hibernate |
+| account-service | MongoDB | `account-db` | `accounts`, `processed_events`, `dlq_analytics` | DLQ TTL: 30 days |
+| budget-service | MongoDB | `budget-db` | `budgets`, `processed_events` | |
+| invest-service | MongoDB | `invest-db` | `investments`, `processed_events` | |
+| expense-service | MySQL | `expensedb` | `expenses`, `processed_events` | JPA/Hibernate + Flyway |
+| goal-service | MySQL | `goaldb` | `goals`, `processed_events` | JPA/Hibernate + Flyway |
 | authorization-server | In-Memory | — | `RegisteredClientRepository` | Resets on restart |
 
 ### Schema Highlights
@@ -814,9 +913,22 @@ Failed messages are:
 UNIQUE INDEX expenses_unique_idx (accountId, expenseId)
 ```
 
+**`processed_events` table (MySQL — expense-service, goal-service):**
+```sql
+CREATE TABLE processed_events (
+    event_id     VARCHAR(36) PRIMARY KEY,
+    processed_at TIMESTAMP  NOT NULL DEFAULT NOW()
+);
+```
+
 **`accounts` MongoDB index:**
 ```
 { accountId: 1 } — unique
+```
+
+**`processed_events` MongoDB collection (account-service, budget-service, invest-service):**
+```
+{ _id: eventId }  — unique (enforced by @Id)
 ```
 
 ### Credentials (per environment)
@@ -1063,6 +1175,8 @@ Jenkins Multibranch Pipeline
   └────────────────────────────────────────────────┘
 ```
 
+> **api-contracts build note:** The `api-contracts` pipeline runs AsyncAPI CLI via `npx` to generate event payload classes from `api-contracts/events/*.asyncapi.yaml`. Node.js 18+ must be installed on the Jenkins host (`brew install node`). A Node.js guard at the start of the Build stage fails fast with a clear message if Node.js is missing.
+
 ### 9.2 Jenkins Jobs
 
 | Job | Type | Repo | Purpose |
@@ -1125,7 +1239,7 @@ Dev images never push to a registry — they are loaded directly into Minikube c
 
 **Published artifacts:**
 ```
-com.akhil.microservices:api-contracts:1.0.0
+com.akhil.microservices:api-contracts:1.1.0   (event payload classes + typed Event<K,T> envelope)
 com.akhil.microservices:util:1.0.0
 ```
 
@@ -1193,17 +1307,7 @@ dashboard-service/docs/dashboard-service.http
 | `baseUrl` | `https://localhost:8443` | `https://minikube.me` |
 | `authUrl` | `https://localhost:8443` | `https://minikube.me` |
 
-### 10.5 Partitioned Messaging (Advanced)
-
-Dashboard Service supports Kafka partitioned streams via the `streaming_partitioned` Spring profile. Enable with:
-
-```yaml
-SPRING_PROFILES_ACTIVE: docker,kafka,streaming_partitioned
-```
-
-Partition key is set via message headers. All producer groups have `required-groups: auditGroup` configured for guaranteed delivery to audit consumers.
-
-### 10.6 Verifying Events
+### 10.5 Verifying Events
 
 ```bash
 # RabbitMQ Management UI
@@ -1237,6 +1341,18 @@ Cause: `infra/deploy-service/main` was never run — the `parameters {}` block i
 Fix: Jenkins → infra → deploy-service → Scan Multibranch Pipeline Now
      Then: Jenkins → infra → deploy-service → main → Build Now (let it fail — that's OK)
      Re-run the failing service build
+```
+
+### api-contracts build fails with "node: command not found"
+
+Cause: Node.js not installed. The api-contracts build invokes AsyncAPI CLI via `npx` to generate event payload classes — Node.js 18+ is required.
+
+```bash
+brew install node
+node --version   # must be >= 18
+npx --version    # must be >= 9
+
+# Then re-run the api-contracts Jenkins pipeline
 ```
 
 ### Nexus unreachable from Gradle
@@ -1342,11 +1458,13 @@ Jenkins → infra → deploy-infra → Build with Parameters (SETUP_CLUSTER=true
 | Cloud | Spring Cloud | 2025.1.1 |
 | Messaging | Spring Cloud Stream | — |
 | REST Docs | SpringDoc OpenAPI | — |
+| Event Schema | AsyncAPI | 3.0 |
 | GraphQL | Spring GraphQL | — |
 | Mapping | MapStruct | 1.6.3 |
 | Resilience | Resilience4j | via Spring Cloud |
 | Tracing | Micrometer / Brave (Zipkin) | — |
 | Build | Gradle | latest wrapper |
+| Node.js (build only) | Node.js | 18+ |
 | Containers | Docker | ≥ 24 |
 | Orchestration | Kubernetes (Minikube) | 1.32.0 |
 | Package Manager | Helm | ≥ 3.14 |
